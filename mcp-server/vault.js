@@ -91,6 +91,39 @@ export async function searchNotes(vaultPath, query, limit = 10) {
 }
 
 /**
+ * Query notes by parsed YAML frontmatter fields.
+ * @param {string} vaultPath
+ * @param {Record<string, unknown>} where
+ * @param {number|{limit?: number, offset?: number, query?: string, select?: string[], sort?: Array<{field: string, direction?: string}>}} [options=10]
+ * @returns {Promise<Array<Record<string, unknown>>>}
+ */
+export async function queryNotes(vaultPath, where = {}, options = 10) {
+  const queryOptions = normalizeQueryOptions(options)
+  const files = await findMarkdownFiles(vaultPath)
+  const matches = []
+
+  for (const filePath of files) {
+    const content = await readUtf8File(filePath)
+    const filename = path.basename(filePath, '.md')
+    const parsed = parseMarkdownNote(content)
+    if (!matchesFrontmatterWhere(parsed.data, where)) continue
+    if (!matchesNoteQuery(content, parsed.content, queryOptions.query)) continue
+
+    matches.push({
+      path: path.relative(vaultPath, filePath),
+      title: parsed.data.title || extractTitle(content, filename),
+      frontmatter: parsed.data,
+      snippet: extractSnippet(parsed.content || content, ''),
+    })
+  }
+
+  const sorted = sortQueryResults(matches, queryOptions.sort)
+  return sorted
+    .slice(queryOptions.offset, queryOptions.offset + queryOptions.limit)
+    .map(result => projectQueryResult(result, queryOptions.select))
+}
+
+/**
  * Get vault context: unique types, note count, top-level folders, and 20 most recent notes.
  * @param {string} vaultPath
  * @returns {Promise<{types: string[], noteCount: number, folders: string[], recentNotes: Array<{path: string, title: string, type: string|null}>, vaultPath: string}>}
@@ -158,6 +191,180 @@ function isVaultRelativePath(relativePath) {
 
 function matchesSearchQuery(title, content, query) {
   return title.toLowerCase().includes(query) || content.toLowerCase().includes(query)
+}
+
+function normalizeQueryOptions(options) {
+  if (typeof options === 'number') {
+    return {
+      limit: normalizeLimit(options),
+      offset: 0,
+      query: '',
+      select: null,
+      sort: [],
+    }
+  }
+
+  const opts = isPlainObject(options) ? options : {}
+  return {
+    limit: normalizeLimit(opts.limit),
+    offset: normalizeOffset(opts.offset),
+    query: typeof opts.query === 'string' ? opts.query : '',
+    select: Array.isArray(opts.select) ? opts.select.filter(item => typeof item === 'string') : null,
+    sort: normalizeSort(opts.sort),
+  }
+}
+
+function normalizeLimit(limit) {
+  return Number.isFinite(limit) && limit > 0 ? limit : 10
+}
+
+function normalizeOffset(offset) {
+  return Number.isFinite(offset) && offset > 0 ? offset : 0
+}
+
+function normalizeSort(sort) {
+  if (!Array.isArray(sort)) return []
+  return sort
+    .filter(item => isPlainObject(item) && typeof item.field === 'string' && item.field)
+    .map(item => ({
+      field: item.field,
+      direction: item.direction === 'desc' ? 'desc' : 'asc',
+    }))
+}
+
+function matchesNoteQuery(rawContent, markdownContent, query) {
+  if (!query) return true
+  const q = query.toLowerCase()
+  return matchesSearchQuery(extractTitle(rawContent, ''), markdownContent || rawContent, q)
+}
+
+function matchesFrontmatterWhere(frontmatter, where) {
+  if (!where || typeof where !== 'object' || Array.isArray(where)) return true
+
+  return Object.entries(where).every(([field, expected]) => {
+    if (field === '$and') return matchesLogicalAnd(frontmatter, expected)
+    if (field === '$or') return matchesLogicalOr(frontmatter, expected)
+    return matchesFrontmatterValue(frontmatter[field], expected)
+  })
+}
+
+function matchesLogicalAnd(frontmatter, conditions) {
+  return Array.isArray(conditions) && conditions.every(condition =>
+    matchesFrontmatterWhere(frontmatter, condition)
+  )
+}
+
+function matchesLogicalOr(frontmatter, conditions) {
+  return Array.isArray(conditions) && conditions.some(condition =>
+    matchesFrontmatterWhere(frontmatter, condition)
+  )
+}
+
+function matchesFrontmatterValue(actual, expected) {
+  if (isPlainObject(expected)) {
+    return matchesFrontmatterOperator(actual, expected)
+  }
+  if (Array.isArray(actual)) {
+    return actual.some(item => valuesEqual(item, expected))
+  }
+  return valuesEqual(actual, expected)
+}
+
+function matchesFrontmatterOperator(actual, expected) {
+  if (Object.hasOwn(expected, 'exists')) {
+    return expected.exists ? actual !== undefined : actual === undefined
+  }
+  if (Object.hasOwn(expected, 'contains')) {
+    return frontmatterContains(actual, expected.contains)
+  }
+  if (Object.hasOwn(expected, 'in')) {
+    return Array.isArray(expected.in) && expected.in.some(item => matchesFrontmatterValue(actual, item))
+  }
+  if (Object.hasOwn(expected, 'eq')) {
+    return matchesFrontmatterValue(actual, expected.eq)
+  }
+  if (Object.hasOwn(expected, 'ne')) {
+    return !matchesFrontmatterValue(actual, expected.ne)
+  }
+  return valuesEqual(actual, expected)
+}
+
+function frontmatterContains(actual, expected) {
+  if (Array.isArray(actual)) {
+    return actual.some(item => valuesEqual(item, expected))
+  }
+  if (typeof actual === 'string') {
+    return actual.includes(String(expected))
+  }
+  return false
+}
+
+function valuesEqual(actual, expected) {
+  return actual === expected
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function sortQueryResults(results, sort) {
+  if (!sort.length) return results
+  return [...results].sort((left, right) => compareQueryResults(left, right, sort))
+}
+
+function compareQueryResults(left, right, sort) {
+  for (const criterion of sort) {
+    const compared = compareValues(
+      getResultFieldValue(left, criterion.field),
+      getResultFieldValue(right, criterion.field),
+      criterion.direction,
+    )
+    if (compared !== 0) return compared
+  }
+  return left.path.localeCompare(right.path)
+}
+
+function compareValues(left, right, direction = 'asc') {
+  if (left === right) return 0
+  if (left === undefined || left === null) return 1
+  if (right === undefined || right === null) return -1
+  const multiplier = direction === 'desc' ? -1 : 1
+  if (left instanceof Date && right instanceof Date) return (left.getTime() - right.getTime()) * multiplier
+  if (typeof left === 'number' && typeof right === 'number') return left - right
+  return String(left).localeCompare(String(right)) * multiplier
+}
+
+function projectQueryResult(result, select) {
+  if (!select) return result
+
+  const projected = {}
+  for (const field of select) {
+    const value = getResultFieldValue(result, field)
+    if (value !== undefined) setProjectedField(projected, field, value)
+  }
+  return projected
+}
+
+function getResultFieldValue(result, field) {
+  if (field === 'path') return result.path
+  if (field === 'title') return result.title
+  if (field === 'snippet') return result.snippet
+  if (field === 'frontmatter') return result.frontmatter
+  if (field.startsWith('frontmatter.')) {
+    return result.frontmatter[field.slice('frontmatter.'.length)]
+  }
+  if (Object.hasOwn(result.frontmatter, field)) return result.frontmatter[field]
+  return result[field]
+}
+
+function setProjectedField(target, field, value) {
+  if (!field.startsWith('frontmatter.')) {
+    target[field] = value
+    return
+  }
+
+  target.frontmatter ??= {}
+  target.frontmatter[field.slice('frontmatter.'.length)] = value
 }
 
 function contextNoteWithoutMtime(note) {

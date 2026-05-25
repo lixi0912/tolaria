@@ -22,7 +22,7 @@
 import { createServer } from 'node:http'
 import { WebSocketServer } from 'ws'
 import {
-  getNote, searchNotes,
+  getNote, queryNotes, searchNotes,
 } from './vault.js'
 import { requireVaultPaths } from './vault-path.js'
 import { readAgentInstructions, vaultContextWithInstructions } from './agent-instructions.js'
@@ -95,6 +95,38 @@ async function searchActiveVaults(query, limit = 10) {
   return results.slice(0, requestedLimit)
 }
 
+async function queryActiveVaults(args = {}, vaultPath = null) {
+  const requestedLimit = Number.isFinite(args.limit) && args.limit > 0 ? args.limit : 10
+  const candidates = vaultPath ? [vaultPath] : activeVaultPaths()
+  const results = []
+
+  for (const candidate of candidates) {
+    const vaultResults = await queryNotes(candidate, args.where, {
+      limit: requestedLimit,
+      offset: args.offset,
+      query: args.query,
+      select: args.select,
+      sort: args.sort,
+    })
+    results.push(...vaultResults.map((result) => ({ ...result, vaultPath: candidate })))
+    if (results.length >= requestedLimit) break
+  }
+
+  return {
+    query: {
+      where: args.where ?? {},
+      text: typeof args.query === 'string' ? args.query : '',
+      select: Array.isArray(args.select) ? args.select : null,
+      sort: Array.isArray(args.sort) ? args.sort : [],
+      limit: requestedLimit,
+      offset: Number.isFinite(args.offset) && args.offset > 0 ? args.offset : 0,
+    },
+    matchedCount: results.length,
+    returnedCount: results.length,
+    results: results.slice(0, requestedLimit),
+  }
+}
+
 async function activeVaultContext() {
   const roots = activeVaultPaths()
   if (roots.length === 1) return vaultContextWithInstructions(roots[0])
@@ -162,6 +194,7 @@ const TOOL_EXECUTORS = [
   ['open_note', readNoteTool],
   ['read_note', readNoteTool],
   ['search_notes', (args) => searchActiveVaults(args.query, args.limit)],
+  ['query_notes', (args) => queryActiveVaults(args, requestedVaultPath(args))],
   ['vault_context', () => activeVaultContext()],
   ['list_vaults', () => listVaultsTool()],
   ['ui_open_note', uiOpenNoteTool],

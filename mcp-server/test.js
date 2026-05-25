@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
-  findMarkdownFiles, getNote, searchNotes, vaultContext,
+  findMarkdownFiles, getNote, queryNotes, searchNotes, vaultContext,
 } from './vault.js'
 import { requireVaultPath, requireVaultPaths } from './vault-path.js'
 import { vaultContextWithInstructions } from './agent-instructions.js'
@@ -64,6 +64,7 @@ This note has AI-generated hashtag-style YAML tags.
 title: Second Project
 type: Project
 status: Draft
+archive_date: 2026-01-02
 belongs_to:
   - "[[project/test-project]]"
 ---
@@ -71,6 +72,19 @@ belongs_to:
 # Second Project
 
 Another project for testing list and context.
+`)
+
+  await writeTextFile(path.join(tmpDir, 'project', 'archive-project.md'), `---
+title: Archive Project
+type: ArchiveRecord
+status: Done
+archive_date: 2026-02-03
+product_versions: [4.8, 4.9]
+---
+
+# Archive Project
+
+INSTANT-1301 archive terminal record.
 `)
 })
 
@@ -81,11 +95,12 @@ after(async () => {
 describe('findMarkdownFiles', () => {
   it('should find all .md files recursively', async () => {
     const files = await findMarkdownFiles(tmpDir)
-    assert.equal(files.length, 4)
+    assert.equal(files.length, 5)
     assert.ok(files.some(f => f.endsWith('test-project.md')))
     assert.ok(files.some(f => f.endsWith('daily-log.md')))
     assert.ok(files.some(f => f.endsWith('second-project.md')))
     assert.ok(files.some(f => f.endsWith('hashtag-tags.md')))
+    assert.ok(files.some(f => f.endsWith('archive-project.md')))
   })
 })
 
@@ -149,6 +164,123 @@ describe('searchNotes', () => {
   })
 })
 
+describe('queryNotes', () => {
+  it('finds notes by exact frontmatter field', async () => {
+    const results = await queryNotes(tmpDir, { type: 'Project' })
+    assert.equal(results.length, 1)
+    assert.equal(results[0].path, 'project/second-project.md')
+    assert.equal(results[0].frontmatter.status, 'Draft')
+  })
+
+  it('finds notes by multiple frontmatter fields', async () => {
+    const results = await queryNotes(tmpDir, { type: 'Project', status: 'Draft' })
+    assert.deepEqual(results.map(result => result.path), ['project/second-project.md'])
+  })
+
+  it('matches array frontmatter values with contains', async () => {
+    const results = await queryNotes(tmpDir, { belongs_to: { contains: '[[project/test-project]]' } })
+    assert.deepEqual(results.map(result => result.path), ['project/second-project.md'])
+  })
+
+  it('matches inline array frontmatter values by exact value', async () => {
+    const results = await queryNotes(tmpDir, { tags: '#abc' })
+    assert.deepEqual(results.map(result => result.path), ['note/hashtag-tags.md'])
+  })
+
+  it('supports exists operator', async () => {
+    const results = await queryNotes(tmpDir, { status: { exists: true } })
+    assert.deepEqual(
+      results.map(result => result.path).sort(),
+      ['project/archive-project.md', 'project/second-project.md', 'project/test-project.md'],
+    )
+  })
+
+  it('supports ne operator', async () => {
+    const results = await queryNotes(tmpDir, { status: { ne: 'Draft' }, type: { exists: true } })
+    assert.deepEqual(
+      results.map(result => result.path).sort(),
+      ['note/hashtag-tags.md', 'project/archive-project.md'],
+    )
+  })
+
+  it('supports in operator', async () => {
+    const results = await queryNotes(tmpDir, { type: { in: ['ArchiveRecord', 'Missing'] } })
+    assert.deepEqual(results.map(result => result.path), ['project/archive-project.md'])
+  })
+
+  it('supports $and and $or logical operators', async () => {
+    const results = await queryNotes(tmpDir, {
+      $and: [
+        { status: { exists: true } },
+        {
+          $or: [
+            { type: 'ArchiveRecord' },
+            { status: 'Draft' },
+          ],
+        },
+      ],
+    })
+    assert.deepEqual(
+      results.map(result => result.path).sort(),
+      ['project/archive-project.md', 'project/second-project.md'],
+    )
+  })
+
+  it('filters queryNotes results by title or content query', async () => {
+    const results = await queryNotes(tmpDir, { type: 'ArchiveRecord' }, { query: 'INSTANT-1301' })
+    assert.deepEqual(results.map(result => result.path), ['project/archive-project.md'])
+  })
+
+  it('sorts results by frontmatter field', async () => {
+    const results = await queryNotes(
+      tmpDir,
+      { status: { exists: true } },
+      { sort: [{ field: 'archive_date', direction: 'desc' }] },
+    )
+    assert.deepEqual(
+      results.map(result => result.path),
+      ['project/archive-project.md', 'project/second-project.md', 'project/test-project.md'],
+    )
+  })
+
+  it('supports offset and limit together', async () => {
+    const results = await queryNotes(
+      tmpDir,
+      { status: { exists: true } },
+      { sort: [{ field: 'title' }], offset: 1, limit: 1 },
+    )
+    assert.deepEqual(results.map(result => result.path), ['project/second-project.md'])
+  })
+
+  it('projects selected result fields', async () => {
+    const results = await queryNotes(
+      tmpDir,
+      { type: 'ArchiveRecord' },
+      { select: ['path', 'title', 'frontmatter.type', 'frontmatter.archive_date'] },
+    )
+    assert.deepEqual(results, [
+      {
+        path: 'project/archive-project.md',
+        title: 'Archive Project',
+        frontmatter: {
+          type: 'ArchiveRecord',
+          archive_date: new Date('2026-02-03T00:00:00.000Z'),
+        },
+      },
+    ])
+  })
+
+  it('returns all notes for empty where objects', async () => {
+    const results = await queryNotes(tmpDir, {}, { limit: 10 })
+    assert.equal(results.length, 5)
+  })
+
+  it('respects limit', async () => {
+    const results = await queryNotes(tmpDir, { title: { exists: true } }, 1)
+    assert.equal(results.length, 1)
+  })
+})
+
 describe('vaultContext', () => {
   it('should return types, recent notes, and vault path', async () => {
     const ctx = await vaultContext(tmpDir)
@@ -192,7 +324,7 @@ describe('vaultContext', () => {
 
   it('should report correct note count', async () => {
     const ctx = await vaultContext(tmpDir)
-    assert.equal(ctx.noteCount, 4)
+    assert.equal(ctx.noteCount, 5)
   })
 
   it('includes root AGENTS.md instructions when present', async () => {
@@ -315,6 +447,7 @@ describe('stdio process lifecycle', () => {
       const toolsByName = new Map(tools.map(tool => [tool.name, tool]))
       const safeReadTools = [
         'search_notes',
+        'query_notes',
         'get_vault_context',
         'list_vaults',
         'get_note',
@@ -330,6 +463,37 @@ describe('stdio process lifecycle', () => {
         assert.equal(tool.annotations?.destructiveHint, false, `${name} should not be treated as destructive`)
         assert.equal(tool.annotations?.openWorldHint, false, `${name} should stay scoped to local active vaults`)
       }
+    } finally {
+      await closeMcpClient(client, stderr)
+    }
+  })
+
+  it('queries frontmatter over stdio MCP with stable response metadata', async () => {
+    const { client, stderr } = await connectMcpClient()
+
+    try {
+      const response = await client.callTool({
+        name: 'query_notes',
+        arguments: {
+          where: { type: 'ArchiveRecord' },
+          query: 'INSTANT-1301',
+          select: ['path', 'frontmatter.type'],
+          limit: 5,
+        },
+      })
+      const payload = JSON.parse(response.content[0].text)
+      assert.equal(payload.matchedCount, 1)
+      assert.equal(payload.returnedCount, 1)
+      assert.deepEqual(payload.query.where, { type: 'ArchiveRecord' })
+      assert.equal(payload.query.text, 'INSTANT-1301')
+      assert.deepEqual(payload.results, [
+        {
+          path: 'project/archive-project.md',
+          frontmatter: { type: 'ArchiveRecord' },
+          vaultPath: tmpDir,
+          vaultLabel: path.basename(tmpDir),
+        },
+      ])
     } finally {
       await closeMcpClient(client, stderr)
     }

@@ -6,6 +6,7 @@
  * app-managed agent's own Safe / Power User permission profile:
  *
  *   - search_notes: full-text search across vault notes
+ *   - query_notes: structured frontmatter query across vault notes
  *   - get_vault_context: vault structure overview (types, note count, folders)
  *   - get_note: parsed frontmatter + content (convenience over raw cat)
  *   - open_note: signal Tolaria UI to open a note as a tab
@@ -19,7 +20,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import WebSocket from 'ws'
-import { searchNotes, getNote } from './vault.js'
+import { searchNotes, getNote, queryNotes } from './vault.js'
 import { requireVaultPaths } from './vault-path.js'
 import { readAgentInstructions, vaultContextWithInstructions } from './agent-instructions.js'
 import path from 'node:path'
@@ -121,6 +122,42 @@ const TOOLS = [
         limit: { type: 'number', description: 'Maximum number of results (default: 10)' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'query_notes',
+    description: 'Query vault notes by parsed YAML frontmatter fields. Supports exact matches, {contains, in, exists, eq, ne}, $and/$or, optional text query, select, sort, limit, and offset.',
+    annotations: LOCAL_READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        where: {
+          type: 'object',
+          description: 'Frontmatter field filters, for example {"type":"archive","project":"[[InstantApp]]","product_versions":{"contains":"4.8"}}.',
+          additionalProperties: true,
+        },
+        query: { type: 'string', description: 'Optional title/content substring filter applied after frontmatter matching.' },
+        select: {
+          type: 'array',
+          description: 'Optional result projection fields, for example ["path","title","frontmatter.type"].',
+          items: { type: 'string' },
+        },
+        sort: {
+          type: 'array',
+          description: 'Optional sort criteria, for example [{"field":"archive_date","direction":"desc"}].',
+          items: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              direction: { type: 'string', enum: ['asc', 'desc'] },
+            },
+            required: ['field'],
+          },
+        },
+        limit: { type: 'number', description: 'Maximum number of results (default: 10)' },
+        offset: { type: 'number', description: 'Number of matched results to skip before returning results (default: 0).' },
+        vaultPath: { type: 'string', description: 'Optional target vault root when multiple vaults are active.' },
+      },
     },
   },
   {
@@ -250,6 +287,38 @@ async function searchActiveVaults(query, limit = 10) {
   return results.slice(0, requestedLimit)
 }
 
+async function queryActiveVaults(args = {}, vaultPath = null) {
+  const requestedLimit = Number.isFinite(args.limit) && args.limit > 0 ? args.limit : 10
+  const candidates = vaultPath ? [vaultPath] : activeVaultPaths()
+  const results = []
+
+  for (const candidate of candidates) {
+    const vaultResults = await queryNotes(candidate, args.where, {
+      limit: requestedLimit,
+      offset: args.offset,
+      query: args.query,
+      select: args.select,
+      sort: args.sort,
+    })
+    results.push(...vaultResults.map((result) => withVaultMetadata(result, candidate)))
+    if (results.length >= requestedLimit) break
+  }
+
+  return {
+    query: {
+      where: args.where ?? {},
+      text: typeof args.query === 'string' ? args.query : '',
+      select: Array.isArray(args.select) ? args.select : null,
+      sort: Array.isArray(args.sort) ? args.sort : [],
+      limit: requestedLimit,
+      offset: Number.isFinite(args.offset) && args.offset > 0 ? args.offset : 0,
+    },
+    matchedCount: results.length,
+    returnedCount: results.length,
+    results: results.slice(0, requestedLimit),
+  }
+}
+
 async function activeVaultContext(targetVaultPath = null) {
   const roots = activeVaultPaths()
   if (targetVaultPath) return vaultContextWithInstructions(targetVaultPath)
@@ -274,6 +343,11 @@ async function handleSearchNotes(args) {
     ? 'No matching notes found.'
     : results.map(r => `**${r.title}** (${r.vaultLabel} / ${r.path})\n${r.snippet}`).join('\n\n')
   return { content: [{ type: 'text', text }] }
+}
+
+async function handleQueryNotes(args = {}) {
+  const result = await queryActiveVaults(args, requestedVaultPath(args))
+  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
 }
 
 async function handleVaultContext(args = {}) {
@@ -321,6 +395,7 @@ function handleRefreshVault(args) {
 
 const TOOL_HANDLERS = new Map([
   ['search_notes', handleSearchNotes],
+  ['query_notes', handleQueryNotes],
   ['get_vault_context', handleVaultContext],
   ['list_vaults', handleListVaults],
   ['get_note', handleGetNote],
